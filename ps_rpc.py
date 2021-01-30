@@ -159,7 +159,7 @@ class Worker(object):
                 else:
                     p.grad = torch.from_numpy(gradients[name])
 
-@ray.remote(num_gpus=1, num_cpus=1)
+@ray.remote(num_cpus=1)
 class PS(object):
     def __init__(self):
         # torch.manual_seed(0)
