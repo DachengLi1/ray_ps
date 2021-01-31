@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import numpy as np
 import os
+import time
 import ray
 import torch
 import torch.nn as nn
@@ -14,8 +15,6 @@ from torchvision import transforms
 from ray.util import collective
 import logging
 
-logger = logging.Logger(__name__)
-logger.setLevel("DEBUG")
 @ray.remote(num_gpus=1, num_cpus=1)
 class Worker(object):
     def __init__(self,
@@ -143,15 +142,15 @@ class Worker(object):
                 to_recv = weights[key]
                 param_recv = torch.zeros(to_recv.size()).cuda()
                 collective.recv(param_recv, self.num_workers+i, "default")
-                param[key] = param_recv
+                params[key] = param_recv
 
         grad, loss = self.compute_gradients(params)
 
         # send this grad to every server
         split_grad = self.split_gradients(grad, self.assignments)
         for i in range(self.num_ps):
-            this_shard = index_shard(split_grad, i)
-            for _, v in split_grad.items():
+            this_shard = self.index_shard(split_grad, i)
+            for _, v in this_shard.items():
                 collective.send(v, self.num_workers+i, "default")
 
         return loss
@@ -168,11 +167,10 @@ class PS(object):
         self.rank = rank
         collective.init_collective_group(self.world_size, self.rank, "nccl", "default")
 
-    def send_params(self, worker):
+    def send_params(self, dst_rank):
         """ Send this param shard to the destination worker """
-        dst_rank = self.workers.index(worker)
         for _, v in self.params.items():
-            collective.send(self.v, dst_rank, "default")
+            collective.send(v, dst_rank, "default")
 
     def get_params(self):
         return self.params
@@ -183,26 +181,14 @@ class PS(object):
         self.optimizer = torch.optim.SGD(self.params.values(), lr=0.001)
         return True
 
-    def apply_updates(self, *list_of_gradients):
-        assert(len(list_of_gradients) >= 1)
-        summed_gradient_dict = dict()
-        for name in self.params:
-            summed_gradient_dict[name] = \
-                torch.stack([grads[name] for grads in list_of_gradients]).sum(dim=0)
-        self.optimizer.zero_grad()
-        self._set_gradients(summed_gradient_dict)
-        self.optimizer.step()
-        return True
-
     def _set_gradients(self, gradients):
         # gradients should be a stitched dict
         for name, p in self.get_params().items():
             if gradients[name] is not None:
                 p.grad = gradients[name]
     
-    def update(self, worker):
+    def update(self, src_rank):
         """Receive gradients and update"""
-        src_rank = self.workers.index(worker)
         keys = self.params.keys()
         grads = dict()
         for key in keys:
@@ -210,7 +196,11 @@ class PS(object):
             grad_recv = torch.zeros(to_recv.size()).cuda()
             collective.recv(grad_recv, src_rank, "default")
             grads[key] = grad_recv
-        self.apply_updates([grads])
+        
+        self.optimizer.zero_grad()
+        self._set_gradients(grads)
+        self.optimizer.step()
+        return True
 
 class PSStrategy(object):
     def __init__(self,
@@ -267,12 +257,12 @@ class PSStrategy(object):
         for worker in self.workers:
             for server in self.servers:
                 # every server sends its shard to the worker
-                server.send_params.remote(worker)
+                server.send_params.remote(self.workers.index(worker))
             # the worker receives shards from ps, compute loss, gradients
             # and sends these gradients to every server
             loss = worker.compute.remote()
             for server in self.servers:
-                rets.append(server.update.remote(worker))
+                rets.append(server.update.remote(self.workers.index(worker)))
             loss_vals.append(loss)
         ray.wait(rets)
         return ray.get(loss_vals)
