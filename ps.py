@@ -146,12 +146,17 @@ class Worker(object):
                 to_recv = weights[key]
                 recv_list[-1].append(torch.randn(to_recv.size()).cuda())
         
+#        logging.warning(f" worker {self.rank} {recv_list[0][0][0].size()}, {recv_list[0][1][0]}, {recv_list[0][2][0]}")
         groupStart()
         for i in range(self.num_ps):
             for j in range(len(self.name_list[i])):
                 collective.recv(recv_list[i][j], self.num_workers+i, "default")
+#                if j == 2:
+#                    break
+#            break
         groupEnd()
-        
+#        logging.warning(f"worker {self.rank} {recv_list[0][0][0].size()}, {recv_list[0][1][0]}, {recv_list[0][2][0]}")
+#        time.sleep(100)
         for i in range(self.num_ps):
             param_shard_keys = self.name_list[i]
             for j in range(len(param_shard_keys)):
@@ -175,6 +180,7 @@ class PS(object):
         self.workers = workers
         self.world_size = world_size
         self.rank = rank
+        self.grad_counts = 0
         collective.init_collective_group(self.world_size, self.rank, "nccl", "default")
         for i in range(len(self.workers)):
             recv = torch.zeros(1,).cuda()
@@ -199,12 +205,16 @@ class PS(object):
         self.optimizer = torch.optim.SGD(self.params.values(), lr=0.001)
         return True
 
-    def _set_gradients(self, gradients):
+    def _inc_gradients(self, gradients):
         # gradients should be a stitched dict
         for name, p in self.get_params().items():
             if gradients[name] is not None:
-                p.grad = gradients[name]
-    
+                if p.grad is None:
+                    p.grad = gradients[name]
+                else: 
+                    p.grad += gradients[name]
+        self.grad_counts += 1
+
     def update(self, src_rank):
         """Receive gradients and update"""
         keys = list(self.params.keys())
@@ -212,7 +222,7 @@ class PS(object):
         recv_list = []
         for key in keys:
             to_recv = self.params[key]
-            recv_list.append(torch.randn(to_recv.size()).cuda())
+            recv_list.append(torch.zeros(to_recv.size()).cuda())
 
         groupStart()
         for i in range(len(keys)):
@@ -222,9 +232,13 @@ class PS(object):
         for i in range(len(keys)):
             grads[keys[i]] = recv_list[i]
 
-        self.optimizer.zero_grad()
-        self._set_gradients(grads)
-        self.optimizer.step()
+        self._inc_gradients(grads)
+        if self.grad_counts == len(self.workers):
+            #self.optimizer.zero_grad()
+            #self._set_gradients(grads)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
         return True
 
 class PSStrategy(object):
@@ -288,6 +302,7 @@ class PSStrategy(object):
             loss = worker.compute.remote()
             for server in self.servers:
                 rets.append(server.update.remote(self.workers.index(worker)))
+            rets.append(loss)
             loss_vals.append(loss)
-        ray.wait(rets)
+        ray.get(rets)
         return ray.get(loss_vals)
