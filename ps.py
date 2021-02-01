@@ -14,7 +14,7 @@ from filelock import FileLock
 from torchvision import transforms
 from ray.util import collective
 import logging
-
+from cupy.cuda.nccl import groupStart, groupEnd
 @ray.remote(num_gpus=1, num_cpus=1)
 class Worker(object):
     def __init__(self,
@@ -23,8 +23,6 @@ class Worker(object):
                  world_size,
                  rank,
                  num_ps):
-        # torch.manual_seed(0)
-        # np.random.seed(0)
         self.model_type = model
         print("=> creating model '{}'".format(model))
         self.model = torchmodels.__dict__[model]().cuda()
@@ -39,7 +37,13 @@ class Worker(object):
         # index i of this list stores the names of params in ith server.
         self.name_list = [[] for i in range(num_ps)]
         collective.init_collective_group(world_size, rank, "nccl", "default")
-
+        for i in range(num_ps):
+            send = torch.ones(1,).cuda()
+            collective.send(send, self.num_workers + i, "default")
+        for i in range(num_ps):
+            send = torch.ones(1,).cuda()
+            collective.recv(send, self.num_workers + i, "default")
+    
     def num_params(self):
         return len(self.get_weights())
 
@@ -94,7 +98,6 @@ class Worker(object):
         shards = [dict() for i in range(num_shards)]
         for i, (k, v) in enumerate(params.items()):
             shards[assignments[i]][k] = v.data.cpu()  # this will only be used by ps which locates on cpus
-            # shards[assignments[i]][k] = v  # this will only be used by ps which locates on cpus
         return shards
 
     def index_shard(self, shards, index):
@@ -119,7 +122,6 @@ class Worker(object):
     def get_gradients(self):
         grad_dict = {}
         for name, p in self.model.named_parameters():
-            # grad = None if p.grad is None else p.grad
             grad_dict[name] = p.grad
         return grad_dict
 
@@ -135,43 +137,59 @@ class Worker(object):
         param_shards = []
         weights = self.get_weights(cpu=False)
         params = dict()
+        # create the receive lists to group collective calls
+        recv_list = []
         for i in range(self.num_ps):
-            # the parameter set of this server
+            recv_list.append([])
             param_shard_keys = self.name_list[i]
             for key in param_shard_keys:
                 to_recv = weights[key]
-                param_recv = torch.zeros(to_recv.size()).cuda()
-                collective.recv(param_recv, self.num_workers+i, "default")
-                params[key] = param_recv
-
+                recv_list[-1].append(torch.randn(to_recv.size()).cuda())
+        
+        groupStart()
+        for i in range(self.num_ps):
+            for j in range(len(self.name_list[i])):
+                collective.recv(recv_list[i][j], self.num_workers+i, "default")
+        groupEnd()
+        
+        for i in range(self.num_ps):
+            param_shard_keys = self.name_list[i]
+            for j in range(len(param_shard_keys)):
+                params[param_shard_keys[j]] = recv_list[i][j]
+                
         grad, loss = self.compute_gradients(params)
-
-        # send this grad to every server
         split_grad = self.split_gradients(grad, self.assignments)
+        groupStart()
         for i in range(self.num_ps):
             this_shard = self.index_shard(split_grad, i)
             for _, v in this_shard.items():
                 collective.send(v, self.num_workers+i, "default")
-
+        groupEnd()
         return loss
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class PS(object):
     def __init__(self, workers, world_size, rank):
-        # torch.manual_seed(0)
-        # np.random.seed(0)
         self.params = dict()
         self.optimizer = None
         self.workers = workers
         self.world_size = world_size
         self.rank = rank
         collective.init_collective_group(self.world_size, self.rank, "nccl", "default")
+        for i in range(len(self.workers)):
+            recv = torch.zeros(1,).cuda()
+            collective.recv(recv, i, "default")
+        for i in range(len(self.workers)):
+            recv = torch.zeros(1,).cuda()
+            collective.send(recv, i, "default")
 
     def send_params(self, dst_rank):
         """ Send this param shard to the destination worker """
+        groupStart()
         for _, v in self.params.items():
             collective.send(v, dst_rank, "default")
-
+        groupEnd()
+    
     def get_params(self):
         return self.params
 
@@ -189,14 +207,21 @@ class PS(object):
     
     def update(self, src_rank):
         """Receive gradients and update"""
-        keys = self.params.keys()
+        keys = list(self.params.keys())
         grads = dict()
+        recv_list = []
         for key in keys:
             to_recv = self.params[key]
-            grad_recv = torch.zeros(to_recv.size()).cuda()
-            collective.recv(grad_recv, src_rank, "default")
-            grads[key] = grad_recv
+            recv_list.append(torch.randn(to_recv.size()).cuda())
+
+        groupStart()
+        for i in range(len(keys)):
+            collective.recv(recv_list[i], src_rank, "default")
+        groupEnd()
         
+        for i in range(len(keys)):
+            grads[keys[i]] = recv_list[i]
+
         self.optimizer.zero_grad()
         self._set_gradients(grads)
         self.optimizer.step()
