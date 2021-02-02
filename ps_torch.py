@@ -38,13 +38,11 @@ class Worker(object):
         self.assignments = None
         # index i of this list stores the names of params in ith server.
         self.name_list = [[] for i in range(num_ps)]
-        collective.init_collective_group(world_size, rank, "nccl", "default")
-        for i in range(num_ps):
-            send = torch.ones(1,).cuda()
-            collective.send(send, self.num_workers + i, "default")
-        for i in range(num_ps):
-            send = torch.ones(1,).cuda()
-            collective.recv(send, self.num_workers + i, "default")
+        os.environ['MASTER_ADDR'] = '10.117.1.35'
+        os.environ['MASTER_PORT'] = '29500'
+        logging.warning("fi w")
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        logging.warning("fi")
 
     def num_params(self):
         return len(self.get_weights())
@@ -146,19 +144,14 @@ class Worker(object):
             param_shard_keys = self.name_list[i]
             for key in param_shard_keys:
                 to_recv = weights[key]
-                recv_list[-1].append((torch.ones(to_recv.size()) * 2).cuda())
+                recv_list[-1].append(torch.zeros(to_recv.size()).cuda())
         
-        logging.warning(f"worker {self.rank} {recv_list[0][0][0][0]}, {recv_list[0][0].size()}, {recv_list[0][1]}, {recv_list[0][1].size()}, {recv_list[0][2]}, {recv_list[0][2].size()}")
-        groupStart()
-        for i in range(self.num_ps):
-            for j in range(len(self.name_list[i])):
-                logging.warning(f"recv {i}{j} {self.name_list[i][j]}")
-                collective.recv(recv_list[i][j], self.num_workers+i, "default")
-                if j == 2:
-                    break
-            break
-        groupEnd()
-        logging.warning(f"worker {self.rank} {recv_list[0][0][0][0]}, {recv_list[0][0].size()}, {recv_list[0][1]}, {recv_list[0][1].size()}, {recv_list[0][2]}, {recv_list[0][2].size()}")
+        logging.warning(f" worker {self.rank} {recv_list[0][0][0][0][0]},{recv_list[0][0].size()}, {recv_list[0][1]}")
+        recv_op = [dist.P2POp(dist.irecv, v, 1) for v in recv_list[0]]
+        reqs = dist.batch_isend_irecv(recv_op)
+        for req in reqs:
+            req.wait()
+        logging.warning(f"worker {self.rank} {recv_list[0][0][0][0][0]}, {recv_list[0][1]}")
         time.sleep(100)
         for i in range(self.num_ps):
             param_shard_keys = self.name_list[i]
@@ -184,32 +177,28 @@ class PS(object):
         self.world_size = world_size
         self.rank = rank
         self.grad_counts = 0
-        collective.init_collective_group(self.world_size, self.rank, "nccl", "default")
-        for i in range(len(self.workers)):
-            recv = torch.zeros(1,).cuda()
-            collective.recv(recv, i, "default")
-        for i in range(len(self.workers)):
-            recv = torch.zeros(1,).cuda()
-            collective.send(recv, i, "default")
+        os.environ['MASTER_ADDR'] = '10.117.1.35'
+        os.environ['MASTER_PORT'] = '29500'
+        logging.warning("fi")
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        logging.warning("fi")
 
     def send_params(self, dst_rank):
         """ Send this param shard to the destination worker """
+        #groupStart()
         count = 0
-        groupStart()
-        for name, v in self.params.items():
-            collective.send(v, dst_rank, "default")
-            if count < 1:
-                count += 1
-                logging.warning(f"{name} {v[0][0]}, {v.size()}")
-            elif count < 2:
-                count += 1
-                logging.warning(f"{name} {v}, {v.size()}")
-            elif count < 3:
-                count += 1
-                logging.warning(f"{name} {v}, {v.size()}")
+        send_op = [dist.P2POp(dist.isend, v, 0) for _, v in self.params.items()]
+        reqs = dist.batch_isend_irecv(send_op)
+        for req in reqs:
+            req.wait()
+        for _, v in self.params.items():
+            count += 1
+            if count == 1:
+                logging.warning(v[0][0])
+            elif count == 2:
+                logging.warning(v)
             else:
                 break
-        groupEnd()
         time.sleep(5000)
     
     def get_params(self):
